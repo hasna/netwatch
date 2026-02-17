@@ -1,0 +1,19 @@
+{
+  "name": "open-netwatch",
+  "version": "0.1.0",
+  "module": "src/index.ts",
+  "type": "module",
+  "bin": {
+    "netwatch": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
