@@ -95,3 +95,46 @@ export function parseRouteOutput(output: string): string {
   const match = output.match(/interface:\s*(\S+)/);
   return match?.[1] ?? "en0";
 }
+
+// -- persistent session tracking --
+export interface SessionBaseline {
+  iface: string;
+  bytesIn: number;
+  bytesOut: number;
+  startedAt: number; // unix ms
+}
+
+import { homedir } from "os";
+import { join } from "path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+
+const SESSION_DIR = join(homedir(), ".netwatch");
+const SESSION_FILE = join(SESSION_DIR, "session.json");
+
+export function saveSession(baseline: SessionBaseline): void {
+  if (!existsSync(SESSION_DIR)) {
+    mkdirSync(SESSION_DIR, { recursive: true });
+  }
+  writeFileSync(SESSION_FILE, JSON.stringify(baseline, null, 2));
+}
+
+export function loadSession(): SessionBaseline | null {
+  if (!existsSync(SESSION_FILE)) return null;
+  try {
+    const data = JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
+    if (data && typeof data.bytesIn === "number" && typeof data.bytesOut === "number" && typeof data.startedAt === "number") {
+      return data as SessionBaseline;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSec / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}

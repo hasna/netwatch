@@ -3,17 +3,21 @@
 import {
   formatBytes,
   formatRate,
+  formatDuration,
   parseLimit,
   padRight,
   padLeft,
   parseNetstatLine,
   parseNettopOutput,
   parseRouteOutput,
+  saveSession,
+  loadSession,
   type InterfaceStats,
+  type SessionBaseline,
 } from "./utils";
 
 const REFRESH_MS = 1500;
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 // -- colors --
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -75,19 +79,26 @@ if (args.includes("--help") || args.includes("-h")) {
 ${bold("open-netwatch")} v${VERSION} - Live network traffic monitor
 
 ${bold("USAGE")}
-  ${cyan("netwatch")}                    Start monitoring
+  ${cyan("netwatch")}                    Start monitoring (resumes tracked session)
+  ${cyan("netwatch --reset")}            Start a new tracking session (run when you connect hotspot)
   ${cyan("netwatch --limit 5")}          Set data cap to 5 GB
   ${cyan("netwatch --limit 500mb")}      Set data cap to 500 MB
   ${cyan("netwatch --interface en0")}    Monitor specific interface
   ${cyan("netwatch --top 15")}           Show top 15 processes
 
 ${bold("OPTIONS")}
+  ${green("--reset")}                Reset tracking session (use when connecting to hotspot)
   ${green("-l, --limit <size>")}     Data cap (e.g. 5, 5gb, 500mb). Default: none
   ${green("-i, --interface <if>")}   Network interface. Default: auto-detect
   ${green("-t, --top <n>")}          Number of top processes. Default: 10
   ${green("-r, --refresh <ms>")}     Refresh interval in ms. Default: 1500
   ${green("-h, --help")}             Show this help
   ${green("-v, --version")}          Show version
+
+${bold("HOW IT WORKS")}
+  Netwatch tracks cumulative data usage across restarts by saving a baseline
+  to ${dim("~/.netwatch/session.json")}. The first run auto-creates a session.
+  Use ${cyan("--reset")} when you connect to a new hotspot to start fresh.
 `);
   process.exit(0);
 }
@@ -105,6 +116,7 @@ function getArg(flags: string[]): string | undefined {
   return undefined;
 }
 
+const doReset = args.includes("--reset");
 const limitStr = getArg(["-l", "--limit"]);
 const dataLimit = limitStr ? parseLimit(limitStr) : null;
 const topN = parseInt(getArg(["-t", "--top"]) || "10", 10);
@@ -117,37 +129,62 @@ async function main() {
     iface = await getDefaultInterface();
   }
 
-  const startStats = await getInterfaceStats(iface);
-  const startTime = Date.now();
-  let sessionIn = 0;
-  let sessionOut = 0;
-  let prevStats = startStats;
-  let prevTime = startTime;
+  // get current interface counters
+  const currentStats = await getInterfaceStats(iface);
+
+  // load or create persistent session baseline
+  let baseline: SessionBaseline;
+  const existing = loadSession();
+
+  if (doReset || !existing || existing.iface !== iface) {
+    baseline = {
+      iface,
+      bytesIn: currentStats.bytesIn,
+      bytesOut: currentStats.bytesOut,
+      startedAt: Date.now(),
+    };
+    saveSession(baseline);
+    if (doReset) {
+      console.log(green(`  Session reset! Tracking from now on ${iface}.`));
+    } else if (!existing) {
+      console.log(green(`  New session started on ${iface}. Use --reset to restart tracking.`));
+    } else {
+      console.log(yellow(`  Interface changed to ${iface}. Session reset automatically.`));
+    }
+  } else {
+    baseline = existing;
+  }
+
+  // for live rate calculation
+  const cliStartTime = Date.now();
+  let prevStats = currentStats;
+  let prevTime = cliStartTime;
 
   console.clear();
-  console.log(dim(`open-netwatch v${VERSION} - monitoring ${iface}... (Ctrl+C to quit)\n`));
 
   const tick = async () => {
     const now = Date.now();
     const elapsed = (now - prevTime) / 1000;
-    const totalElapsed = (now - startTime) / 1000;
 
     const stats = await getInterfaceStats(iface!);
     const processes = await getTopProcesses(topN);
 
+    // live rates (delta since last tick)
     const deltaIn = stats.bytesIn - prevStats.bytesIn;
     const deltaOut = stats.bytesOut - prevStats.bytesOut;
-
     const rateIn = elapsed > 0 ? deltaIn / elapsed : 0;
     const rateOut = elapsed > 0 ? deltaOut / elapsed : 0;
 
-    sessionIn = stats.bytesIn - startStats.bytesIn;
-    sessionOut = stats.bytesOut - startStats.bytesOut;
-    const sessionTotal = sessionIn + sessionOut;
+    // tracked totals (since baseline / hotspot connect)
+    const trackedIn = Math.max(0, stats.bytesIn - baseline.bytesIn);
+    const trackedOut = Math.max(0, stats.bytesOut - baseline.bytesOut);
+    const trackedTotal = trackedIn + trackedOut;
+    const trackingDuration = now - baseline.startedAt;
 
     prevStats = stats;
     prevTime = now;
 
+    // build output
     const lines: string[] = [];
     const width = process.stdout.columns || 80;
     const sep = dim("─".repeat(width));
@@ -156,25 +193,27 @@ async function main() {
     lines.push(bold(`  open-netwatch`) + dim(` v${VERSION}`) + dim(`  │  ${iface}  │  ${new Date().toLocaleTimeString()}`));
     lines.push(sep);
 
-    const uptime = `${Math.floor(totalElapsed / 60)}m ${Math.floor(totalElapsed % 60)}s`;
+    // live rates
     lines.push(
-      `  ${dim("Session:")} ${white(uptime)}` +
+      `  ${dim("Tracking:")} ${white(formatDuration(trackingDuration))}` +
       `    ${dim("Down:")} ${cyan(formatRate(rateIn))}` +
       `    ${dim("Up:")} ${magenta(formatRate(rateOut))}`
     );
     lines.push("");
 
-    lines.push(`  ${dim("Downloaded:")}  ${padLeft(cyan(formatBytes(sessionIn)), 14)}`);
-    lines.push(`  ${dim("Uploaded:  ")}  ${padLeft(magenta(formatBytes(sessionOut)), 14)}`);
-    lines.push(`  ${dim("Total:     ")}  ${padLeft(bold(formatBytes(sessionTotal)), 14)}`);
+    // tracked totals (the important numbers)
+    lines.push(`  ${dim("Downloaded:")}  ${padLeft(cyan(formatBytes(trackedIn)), 14)}`);
+    lines.push(`  ${dim("Uploaded:  ")}  ${padLeft(magenta(formatBytes(trackedOut)), 14)}`);
+    lines.push(`  ${bold("Total:     ")}  ${padLeft(bold(formatBytes(trackedTotal)), 14)}`);
 
+    // data limit bar
     if (dataLimit) {
       lines.push("");
-      const remaining = Math.max(0, dataLimit - sessionTotal);
+      const remaining = Math.max(0, dataLimit - trackedTotal);
       lines.push(`  ${dim("Limit:")}  ${formatBytes(dataLimit)}    ${dim("Remaining:")}  ${formatBytes(remaining)}`);
-      lines.push(`  ${progressBar(sessionTotal, dataLimit, Math.min(50, width - 12))}`);
+      lines.push(`  ${progressBar(trackedTotal, dataLimit, Math.min(50, width - 12))}`);
 
-      if (sessionTotal > dataLimit * 0.9) {
+      if (trackedTotal > dataLimit * 0.9) {
         lines.push(`  ${red(bold("  WARNING: Over 90% of data limit used!"))}`);
       }
     }
@@ -207,7 +246,7 @@ async function main() {
     }
 
     lines.push("");
-    lines.push(dim("  Press Ctrl+C to quit"));
+    lines.push(dim(`  Since ${new Date(baseline.startedAt).toLocaleString()}  │  --reset to restart tracking  │  Ctrl+C to quit`));
 
     process.stdout.write(lines.join("\n"));
   };
@@ -218,12 +257,18 @@ async function main() {
 
   process.on("SIGINT", () => {
     clearInterval(interval);
+    const stats = prevStats;
+    const trackedIn = Math.max(0, stats.bytesIn - baseline.bytesIn);
+    const trackedOut = Math.max(0, stats.bytesOut - baseline.bytesOut);
+    const duration = Date.now() - baseline.startedAt;
+
     console.log("\n");
-    console.log(bold("  Session Summary"));
+    console.log(bold("  Session Summary") + dim(` (${formatDuration(duration)} tracked)`));
     console.log(dim("  ─".repeat(20)));
-    console.log(`  Downloaded:  ${cyan(formatBytes(sessionIn))}`);
-    console.log(`  Uploaded:    ${magenta(formatBytes(sessionOut))}`);
-    console.log(`  Total:       ${bold(formatBytes(sessionIn + sessionOut))}`);
+    console.log(`  Downloaded:  ${cyan(formatBytes(trackedIn))}`);
+    console.log(`  Uploaded:    ${magenta(formatBytes(trackedOut))}`);
+    console.log(`  Total:       ${bold(formatBytes(trackedIn + trackedOut))}`);
+    console.log(dim(`\n  Session saved. Run netwatch again to resume tracking.`));
     console.log("");
     process.exit(0);
   });

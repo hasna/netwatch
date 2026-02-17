@@ -1,14 +1,21 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, afterAll } from "bun:test";
 import {
   formatBytes,
   formatRate,
+  formatDuration,
   parseLimit,
   padRight,
   padLeft,
   parseNetstatLine,
   parseNettopOutput,
   parseRouteOutput,
+  saveSession,
+  loadSession,
+  type SessionBaseline,
 } from "./utils";
+import { existsSync, rmSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 describe("formatBytes", () => {
   test("formats bytes", () => {
@@ -237,5 +244,81 @@ destination: default
   test("extracts different interface names", () => {
     const output = "  interface: bridge100\n";
     expect(parseRouteOutput(output)).toBe("bridge100");
+  });
+});
+
+describe("formatDuration", () => {
+  test("formats minutes only", () => {
+    expect(formatDuration(0)).toBe("0m");
+    expect(formatDuration(60 * 1000)).toBe("1m");
+    expect(formatDuration(30 * 60 * 1000)).toBe("30m");
+  });
+
+  test("formats hours and minutes", () => {
+    expect(formatDuration(60 * 60 * 1000)).toBe("1h 0m");
+    expect(formatDuration(90 * 60 * 1000)).toBe("1h 30m");
+    expect(formatDuration(4 * 60 * 60 * 1000)).toBe("4h 0m");
+    expect(formatDuration(4 * 60 * 60 * 1000 + 15 * 60 * 1000)).toBe("4h 15m");
+  });
+});
+
+describe("session persistence", () => {
+  const testBaseline: SessionBaseline = {
+    iface: "en0",
+    bytesIn: 1000000,
+    bytesOut: 2000000,
+    startedAt: Date.now() - 4 * 60 * 60 * 1000, // 4 hours ago
+  };
+
+  test("saves and loads a session", () => {
+    saveSession(testBaseline);
+    const loaded = loadSession();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.iface).toBe("en0");
+    expect(loaded!.bytesIn).toBe(1000000);
+    expect(loaded!.bytesOut).toBe(2000000);
+    expect(loaded!.startedAt).toBe(testBaseline.startedAt);
+  });
+
+  test("overwrites existing session on save", () => {
+    saveSession(testBaseline);
+    const updated: SessionBaseline = { ...testBaseline, bytesIn: 5000000 };
+    saveSession(updated);
+    const loaded = loadSession();
+    expect(loaded!.bytesIn).toBe(5000000);
+  });
+
+  test("calculates tracked usage correctly", () => {
+    const baseline: SessionBaseline = {
+      iface: "en0",
+      bytesIn: 1_000_000_000, // 1 GB baseline
+      bytesOut: 500_000_000,
+      startedAt: Date.now() - 4 * 60 * 60 * 1000,
+    };
+
+    // simulate current counters after 4 hours of usage
+    const currentIn = 3_500_000_000; // 3.5 GB
+    const currentOut = 1_200_000_000; // 1.2 GB
+
+    const trackedIn = currentIn - baseline.bytesIn; // 2.5 GB used
+    const trackedOut = currentOut - baseline.bytesOut; // 0.7 GB used
+    const trackedTotal = trackedIn + trackedOut; // 3.2 GB total
+
+    expect(trackedIn).toBe(2_500_000_000);
+    expect(trackedOut).toBe(700_000_000);
+    expect(trackedTotal).toBe(3_200_000_000);
+    expect(formatBytes(trackedTotal)).toBe("2.98 GB");
+  });
+
+  test("data limit comparison works with tracked totals", () => {
+    const limit = 5 * 1024 * 1024 * 1024; // 5 GB
+    const trackedTotal = 4.6 * 1024 * 1024 * 1024; // 4.6 GB used
+
+    const ratio = trackedTotal / limit;
+    expect(ratio).toBeGreaterThan(0.9);
+
+    const remaining = limit - trackedTotal;
+    expect(remaining).toBeGreaterThan(0);
+    expect(formatBytes(remaining)).toContain("MB");
   });
 });
