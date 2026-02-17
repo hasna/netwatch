@@ -1,5 +1,17 @@
 #!/usr/bin/env bun
 
+import {
+  formatBytes,
+  formatRate,
+  parseLimit,
+  padRight,
+  padLeft,
+  parseNetstatLine,
+  parseNettopOutput,
+  parseRouteOutput,
+  type InterfaceStats,
+} from "./utils";
+
 const REFRESH_MS = 1500;
 const VERSION = "0.1.0";
 
@@ -12,31 +24,6 @@ const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 const white = (s: string) => `\x1b[37m${s}\x1b[0m`;
-
-// -- helpers --
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-function formatRate(bytesPerSec: number): string {
-  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
-}
-
-function padRight(s: string, n: number): string {
-  // strip ANSI for length calculation
-  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
-  return s + " ".repeat(Math.max(0, n - plain.length));
-}
-
-function padLeft(s: string, n: number): string {
-  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
-  return " ".repeat(Math.max(0, n - plain.length)) + s;
-}
 
 function progressBar(used: number, limit: number, width: number = 30): string {
   const ratio = Math.min(used / limit, 1);
@@ -53,18 +40,6 @@ function progressBar(used: number, limit: number, width: number = 30): string {
 }
 
 // -- data collection --
-interface InterfaceStats {
-  name: string;
-  bytesIn: number;
-  bytesOut: number;
-}
-
-interface ProcessStats {
-  name: string;
-  bytesIn: number;
-  bytesOut: number;
-}
-
 async function exec(cmd: string[]): Promise<string> {
   const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
   const out = await new Response(proc.stdout).text();
@@ -74,77 +49,22 @@ async function exec(cmd: string[]): Promise<string> {
 
 async function getDefaultInterface(): Promise<string> {
   const out = await exec(["route", "get", "default"]);
-  const match = out.match(/interface:\s*(\S+)/);
-  return match?.[1] ?? "en0";
+  return parseRouteOutput(out);
 }
 
 async function getInterfaceStats(iface: string): Promise<InterfaceStats> {
   const out = await exec(["netstat", "-ib"]);
   const lines = out.split("\n");
   for (const line of lines) {
-    const parts = line.trim().split(/\s+/);
-    // format: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
-    if (parts[0] === iface && parts[2] === "<Link#" + parts[2].match(/\d+/)?.[0] + ">") {
-      // Link line has the raw bytes
-      return {
-        name: iface,
-        bytesIn: parseInt(parts[6], 10) || 0,
-        bytesOut: parseInt(parts[9], 10) || 0,
-      };
-    }
-  }
-  // fallback: find first line matching interface with <Link#
-  for (const line of lines) {
-    const parts = line.trim().split(/\s+/);
-    if (parts[0] === iface && parts[2]?.startsWith("<Link#")) {
-      return {
-        name: iface,
-        bytesIn: parseInt(parts[6], 10) || 0,
-        bytesOut: parseInt(parts[9], 10) || 0,
-      };
-    }
+    const stats = parseNetstatLine(line, iface);
+    if (stats) return stats;
   }
   return { name: iface, bytesIn: 0, bytesOut: 0 };
 }
 
-async function getTopProcesses(limit: number = 10): Promise<ProcessStats[]> {
+async function getTopProcesses(limit: number = 10) {
   const out = await exec(["nettop", "-P", "-x", "-d", "-L", "2", "-n", "-J", "bytes_in,bytes_out"]);
-  const lines = out.trim().split("\n");
-  const processes: ProcessStats[] = [];
-
-  for (const line of lines) {
-    // format: name.pid,bytes_in,bytes_out,
-    if (line.startsWith(",") || !line.includes(",")) continue;
-    const parts = line.split(",");
-    if (parts.length < 3) continue;
-
-    const rawName = parts[0].trim();
-    const bytesIn = parseInt(parts[1], 10) || 0;
-    const bytesOut = parseInt(parts[2], 10) || 0;
-
-    if (bytesIn === 0 && bytesOut === 0) continue;
-
-    // clean up process name (remove PID suffix)
-    const name = rawName.replace(/\.\d+$/, "");
-
-    processes.push({ name, bytesIn, bytesOut });
-  }
-
-  // merge processes with same name
-  const merged = new Map<string, ProcessStats>();
-  for (const p of processes) {
-    const existing = merged.get(p.name);
-    if (existing) {
-      existing.bytesIn += p.bytesIn;
-      existing.bytesOut += p.bytesOut;
-    } else {
-      merged.set(p.name, { ...p });
-    }
-  }
-
-  return Array.from(merged.values())
-    .sort((a, b) => (b.bytesIn + b.bytesOut) - (a.bytesIn + a.bytesOut))
-    .slice(0, limit);
+  return parseNettopOutput(out, limit);
 }
 
 // -- CLI args --
@@ -185,17 +105,6 @@ function getArg(flags: string[]): string | undefined {
   return undefined;
 }
 
-function parseLimit(val: string): number | null {
-  const match = val.match(/^([\d.]+)\s*(gb|mb|tb)?$/i);
-  if (!match) return null;
-  const num = parseFloat(match[1]);
-  const unit = (match[2] || "gb").toLowerCase();
-  if (unit === "tb") return num * 1024 * 1024 * 1024 * 1024;
-  if (unit === "gb") return num * 1024 * 1024 * 1024;
-  if (unit === "mb") return num * 1024 * 1024;
-  return num * 1024 * 1024 * 1024; // default GB
-}
-
 const limitStr = getArg(["-l", "--limit"]);
 const dataLimit = limitStr ? parseLimit(limitStr) : null;
 const topN = parseInt(getArg(["-t", "--top"]) || "10", 10);
@@ -226,15 +135,12 @@ async function main() {
     const stats = await getInterfaceStats(iface!);
     const processes = await getTopProcesses(topN);
 
-    // delta since last tick
     const deltaIn = stats.bytesIn - prevStats.bytesIn;
     const deltaOut = stats.bytesOut - prevStats.bytesOut;
 
-    // rates
     const rateIn = elapsed > 0 ? deltaIn / elapsed : 0;
     const rateOut = elapsed > 0 ? deltaOut / elapsed : 0;
 
-    // session totals
     sessionIn = stats.bytesIn - startStats.bytesIn;
     sessionOut = stats.bytesOut - startStats.bytesOut;
     const sessionTotal = sessionIn + sessionOut;
@@ -242,16 +148,14 @@ async function main() {
     prevStats = stats;
     prevTime = now;
 
-    // build output
     const lines: string[] = [];
     const width = process.stdout.columns || 80;
     const sep = dim("─".repeat(width));
 
-    lines.push("\x1b[H\x1b[J"); // clear screen, cursor to top
+    lines.push("\x1b[H\x1b[J");
     lines.push(bold(`  open-netwatch`) + dim(` v${VERSION}`) + dim(`  │  ${iface}  │  ${new Date().toLocaleTimeString()}`));
     lines.push(sep);
 
-    // session stats
     const uptime = `${Math.floor(totalElapsed / 60)}m ${Math.floor(totalElapsed % 60)}s`;
     lines.push(
       `  ${dim("Session:")} ${white(uptime)}` +
@@ -260,12 +164,10 @@ async function main() {
     );
     lines.push("");
 
-    // totals
     lines.push(`  ${dim("Downloaded:")}  ${padLeft(cyan(formatBytes(sessionIn)), 14)}`);
     lines.push(`  ${dim("Uploaded:  ")}  ${padLeft(magenta(formatBytes(sessionOut)), 14)}`);
     lines.push(`  ${dim("Total:     ")}  ${padLeft(bold(formatBytes(sessionTotal)), 14)}`);
 
-    // data limit bar
     if (dataLimit) {
       lines.push("");
       const remaining = Math.max(0, dataLimit - sessionTotal);
@@ -278,8 +180,6 @@ async function main() {
     }
 
     lines.push(sep);
-
-    // top processes
     lines.push(bold("  Top Processes") + dim(` (by traffic this session)`));
     lines.push("");
 
@@ -312,13 +212,10 @@ async function main() {
     process.stdout.write(lines.join("\n"));
   };
 
-  // initial tick
   await tick();
 
-  // loop
   const interval = setInterval(tick, refreshMs);
 
-  // graceful exit
   process.on("SIGINT", () => {
     clearInterval(interval);
     console.log("\n");
