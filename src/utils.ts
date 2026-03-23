@@ -108,20 +108,31 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 
-const SESSION_DIR = join(homedir(), ".netwatch");
-const SESSION_FILE = join(SESSION_DIR, "session.json");
+// New path: ~/.hasna/netwatch/, backward compat: ~/.netwatch/
+const NEW_SESSION_DIR = join(homedir(), ".hasna", "netwatch");
+const OLD_SESSION_DIR = join(homedir(), ".netwatch");
+
+function getSessionDir(): string {
+  const oldFile = join(OLD_SESSION_DIR, "session.json");
+  const newFile = join(NEW_SESSION_DIR, "session.json");
+  // Use old path if it has data and new path doesn't
+  if (existsSync(oldFile) && !existsSync(newFile)) return OLD_SESSION_DIR;
+  return NEW_SESSION_DIR;
+}
 
 export function saveSession(baseline: SessionBaseline): void {
-  if (!existsSync(SESSION_DIR)) {
-    mkdirSync(SESSION_DIR, { recursive: true });
+  const dir = getSessionDir();
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(SESSION_FILE, JSON.stringify(baseline, null, 2));
+  writeFileSync(join(dir, "session.json"), JSON.stringify(baseline, null, 2));
 }
 
 export function loadSession(): SessionBaseline | null {
-  if (!existsSync(SESSION_FILE)) return null;
+  const file = join(getSessionDir(), "session.json");
+  if (!existsSync(file)) return null;
   try {
-    const data = JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
+    const data = JSON.parse(readFileSync(file, "utf-8"));
     if (data && typeof data.bytesIn === "number" && typeof data.bytesOut === "number" && typeof data.startedAt === "number") {
       return data as SessionBaseline;
     }
