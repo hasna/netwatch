@@ -45,6 +45,6 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@hasna/cloud": "0.1.5"
+    "@hasna/cloud": "^0.1.24"
   }
 }
